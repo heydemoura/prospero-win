@@ -575,6 +575,10 @@ wine/ps5/pw_d3d9_cursor_wire.c
 tests/test_d3d9_cursor_wire.c
 docs/d3d9-cursor-wire.md
 wine/ps5/d3d9/pw_d3d9_cursor.h
+tests/lab/d3d9_cursor_transport.c
+tests/lab/d3d9_cursor_transport.py
+tests/lab/d3d9_cursor_transport_device.c
+docs/d3d9-cursor-transport.md
 wine/ps5/d3d9/pw_d3d9_cursor.c
 tests/lab/d3d9_cursor.c
 tests/lab/d3d9_cursor.py
