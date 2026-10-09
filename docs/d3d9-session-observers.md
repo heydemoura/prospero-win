@@ -30,3 +30,40 @@ service compilation at the same source commit with draw capability 65536.
 This change provides the scoped transport hooks; device-owned draw and Transform
 observers, negotiated combined capability, and actual runtime evidence follow
 separately. No console result is claimed here.
+
+## Combined device integration
+
+The device proxy owns declaration evidence and Transform state for its lifetime.
+Successful typed replies and accepted queued commands update those structures
+under the original session gate. State block evidence belongs to the canonical
+state block shell; Create/End commit canonical identity before unlocking, and
+aliases invalidate evidence conservatively. Failed End leaves recording
+knowledge uncertain. Reset invalidates relevant cached live evidence while
+preserving the pinned backend's recording semantics.
+
+The paired build option `--draws` enables both draw admission and Transform
+observers, adding capabilities 65536 and 131072 to the binding-enabled pair.
+Both sides advertise exactly 260095. A different capability mask is rejected at
+HELLO. Runtime batching and local getter serving remain controlled together by
+`PW_D3D9_ASYNC`; its off mode keeps native getter round trips.
+
+The frozen combined source 1e49a4d6 successfully compiled the complete PE32 proxy
+and PE64 service with diagnostics disabled and mask 260095. Both binaries and
+all 154 build inputs were independently reverified.
+
+The retained final-260095-r8 host proof passed at fixture commit 9aa3d56d,
+with shipping source unchanged from 1e49a4d6. All 13 commands exited zero;
+190 source inputs and five artifacts were independently reverified. For each
+of three seeds, direct native DXVK, proxy async-off, and proxy async-on produced
+identical transcripts of Transform answers, operation HRESULTs, and pixel
+readbacks. Controlled stages after Reset rendered red with both user-pointer
+and buffer-backed DrawPrimitive/DrawIndexedPrimitive paths in all modes.
+The controlled interval reduced command RPCs from 56 to 14 and recorded 42
+batched commands. Random-state black readbacks also matched native behavior;
+they were not treated as a substitute for the controlled red-image checks.
+
+Receipt SHA256:
+`51492a1734804675b07091a2e0935d9d47895f4a558df471160f89cfe66a6c93`.
+The host adapter replaces PS5 window association only. This proof establishes
+host compatibility for the tested workloads, not a console result or a game
+performance claim.
