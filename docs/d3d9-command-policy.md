@@ -39,13 +39,11 @@ space and device lifetime before returning S_OK. Any unexpected non-S_OK backend
 result sticks failure, records its sequence and wakes waiters. The service must
 independently validate all commands before executing any batch member.
 
-This first wave is not the final performance scope. Draws81/82 require correct
+This is not the final performance scope. Draws81/82 require correct
 live declaration state: absent declarations fail even with zero primitives;
 SetFVF(0) does not clear a declaration, and state-block recording/application and
-Reset change the required shadow. Constants require exact software-register
-bounds, overflow checks and hardware-layout clamping before NULL testing.
-Object bindings additionally require typed generation pins until execution or
-cancellation. These remain synchronous until their respective proofs exist.
+Reset change the required shadow. Object bindings additionally require typed generation pins until execution or
+cancellation. Draws and object bindings remain synchronous until their respective proofs exist.
 
 The portable fixture checks copied values, malformed lengths, unused arguments,
 all sampler boundaries, texture-stage enum holes and all other method exclusions.
@@ -65,3 +63,42 @@ three native processes, with successful draws/readback/Present and clean exit.
 The receipt freezes89 implementation/header inputs and9 successful commands.
 Portable policy normal and ASan/UBSan tests separately passed4 commands.
 These results do not establish queued session acceptance or performance.
+
+## Constants and transforms
+
+The policy also admits SetTransform44 for VIEW2, PROJECTION3, TEXTURE16..23
+and WORLD256..511 with an owned64-byte matrix. Other indices remain synchronous.
+Pinned `d3d9_util.h`183 maps these into266 entries; device helper4469 and the
+state-block recorder both copy matrices and return S_OK.
+
+Constant methods94/96/98/109/111/113 require exact owned bytes, canonical BOOL
+values and checked software-register bounds. The normalizer preserves backend
+validation order: reject addition overflow and software-range excess, clamp to
+the creation-time layout, then reject NULL only if effective count is nonzero.
+VS limits are8192 float/2048 integer or BOOL software registers; hardware-only
+creation copies at most256/16. Mixed or software creation uses the extended
+layout regardless of later SetSoftwareVertexProcessing. PS limits are224/16.
+Source: device.cpp7775,4639; device.h1269,1128; d3d9_caps.h14..18.
+
+The policy itself sees already owned data and validates software bounds; the
+frontend normalizer must run before reading guest data, using immutable local
+creation flags. Getters and state-block/Reset calls still drain prior commands,
+so no local constant-value shadow is claimed. Large software-mode payloads over
+the4096-byte transport capacity remain an explicit unsupported frontend limit;
+this change must not allocate out of bounds, split a logical call without
+serialization, or invent successful execution for those uploads.
+
+Expanded admission is policy revision2 and requires the additional HELLO feature
+16384 on both peers, alongside command batching. An old first-wave-only peer
+must not accept an expanded-policy pair. This foundation exports the required
+feature and the production session adds it atomically to batch-enabled HELLO.
+The exact feature equality check rejects first-wave/expanded mixed pairs before
+object creation. Expanded production pairs advertise30719; first-wave pairs
+remain14335. Runtime enablement still requires the existing explicit opt-in.
+
+Retained host proof for this extension passed620 setter/Transform comparisons
+and132 constant boundary comparisons per native process, across hardware, mixed
+and software creation modes. Live and state-block recording paths both run.
+The native receipt freezes91 inputs and9 successful commands; frontend staged
+copy has a separate90-input,8-command normal/sanitized/PE32/PE64 proof. No
+queued-session or console acceptance is claimed by these family proofs.
