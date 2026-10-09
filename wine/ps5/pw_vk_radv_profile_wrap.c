@@ -107,8 +107,11 @@ static void enable_locked(int from_env)
         else if (xdg && *xdg) snprintf(probe, sizeof(probe), "%s", xdg);
         else if (home && *home) snprintf(probe, sizeof(probe), "%s/.cache", home);
         else probe[0] = 0;
-        n = snprintf(line + used, sizeof(line) - used, " cache_root=%s writable=%d", probe[0] ? probe : "(none)",
-                     probe[0] ? access(probe, W_OK) == 0 : 0);
+        /* Mesa keeps the cache off without a word when the real and
+         * effective ids differ (its __normal_user check). */
+        n = snprintf(line + used, sizeof(line) - used, " cache_root=%s writable=%d uid=%d euid=%d gid=%d egid=%d",
+                     probe[0] ? probe : "(none)", probe[0] ? access(probe, W_OK) == 0 : 0, (int)getuid(),
+                     (int)geteuid(), (int)getgid(), (int)getegid());
         if (n > 0 && (size_t)n < sizeof(line) - used) used += (size_t)n;
         emit(line, used);
     }
@@ -209,12 +212,31 @@ static void account(unsigned fn, uint64_t t0, uint64_t t1, const char *detail)
     account(PW_VK_RADV_##name, t0, t1, detail); \
     return result
 
-static const char *pipeline_detail(char *buffer, uint32_t count, VkPipelineCreateFlags flags)
+/* A link of libraries (VkPipelineLibraryCreateInfoKHR in pNext, no stages)
+ * should be cheap; a create with stages compiles. The detail says which,
+ * how many libraries or stages, whether the stages carry SPIR-V inline, and
+ * how the call ended (VK_PIPELINE_COMPILE_REQUIRED is 1000297000). */
+static const char *pipeline_detail(char *buffer, uint32_t count, VkPipelineCreateFlags flags, const void *next,
+                                   uint32_t stages, const VkPipelineShaderStageCreateInfo *stage_infos, VkResult result)
 {
-    snprintf(buffer, PW_VK_RADV_PROFILE_DETAIL, "count=%u flags=%#x library=%d link_time_opt=%d fail_on_compile=%d",
+    const VkBaseInStructure *chain;
+    uint32_t libraries = 0, rendering = 0, inline_spirv = 0, i;
+    for (chain = next; chain; chain = chain->pNext)
+    {
+        if (chain->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)
+            libraries = ((const VkPipelineLibraryCreateInfoKHR *)chain)->libraryCount;
+        else if (chain->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) rendering = 1;
+    }
+    for (i = 0; stage_infos && i < stages; i++)
+        for (chain = stage_infos[i].pNext; chain; chain = chain->pNext)
+            if (chain->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) inline_spirv++;
+    snprintf(buffer, PW_VK_RADV_PROFILE_DETAIL,
+             "count=%u flags=%#x library=%d link_time_opt=%d fail_on_compile=%d libraries=%u stages=%u "
+             "inline_spirv=%u rendering_info=%u result=%d",
              count, flags, !!(flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR),
              !!(flags & VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT),
-             !!(flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT));
+             !!(flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT), libraries, stages, inline_spirv,
+             rendering, (int)result);
     return buffer;
 }
 
@@ -225,9 +247,15 @@ static VkResult VKAPI_CALL wrap_vkCreateGraphicsPipelines(VkDevice device, VkPip
                                                           VkPipeline *pPipelines)
 {
     char detail[PW_VK_RADV_PROFILE_DETAIL];
-    TIMED(vkCreateGraphicsPipelines,
-          REAL(vkCreateGraphicsPipelines)(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines),
-          pipeline_detail(detail, createInfoCount, createInfoCount && pCreateInfos ? pCreateInfos[0].flags : 0));
+    const VkGraphicsPipelineCreateInfo *info = createInfoCount && pCreateInfos ? pCreateInfos : NULL;
+    uint64_t t0 = __rdtsc(), t1;
+    VkResult result = REAL(vkCreateGraphicsPipelines)(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator,
+                                                      pPipelines);
+    t1 = __rdtsc();
+    account(PW_VK_RADV_vkCreateGraphicsPipelines, t0, t1,
+            pipeline_detail(detail, createInfoCount, info ? info->flags : 0, info ? info->pNext : NULL,
+                            info ? info->stageCount : 0, info ? info->pStages : NULL, result));
+    return result;
 }
 
 static VkResult VKAPI_CALL wrap_vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
@@ -237,9 +265,15 @@ static VkResult VKAPI_CALL wrap_vkCreateComputePipelines(VkDevice device, VkPipe
                                                          VkPipeline *pPipelines)
 {
     char detail[PW_VK_RADV_PROFILE_DETAIL];
-    TIMED(vkCreateComputePipelines,
-          REAL(vkCreateComputePipelines)(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines),
-          pipeline_detail(detail, createInfoCount, createInfoCount && pCreateInfos ? pCreateInfos[0].flags : 0));
+    const VkComputePipelineCreateInfo *info = createInfoCount && pCreateInfos ? pCreateInfos : NULL;
+    uint64_t t0 = __rdtsc(), t1;
+    VkResult result = REAL(vkCreateComputePipelines)(device, pipelineCache, createInfoCount, pCreateInfos, pAllocator,
+                                                     pPipelines);
+    t1 = __rdtsc();
+    account(PW_VK_RADV_vkCreateComputePipelines, t0, t1,
+            pipeline_detail(detail, createInfoCount, info ? info->flags : 0, info ? info->pNext : NULL, info ? 1 : 0,
+                            info ? &info->stage : NULL, result));
+    return result;
 }
 
 static VkResult VKAPI_CALL wrap_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCreateInfo,
