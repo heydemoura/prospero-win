@@ -1,6 +1,24 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #define COBJMACROS
 #include "pw_d3d9_device_proxy.h"
+#ifdef PW_D3D9_ENABLE_METHODS
+#include "pw_d3d9_device_methods.h"
+#endif
+#ifdef PW_D3D9_ENABLE_RESOURCE
+#include "pw_d3d9_buffer_proxy.h"
+#endif
+#ifdef PW_D3D9_ENABLE_PROGRAM
+#include "pw_d3d9_program_proxy.h"
+#endif
+#ifdef PW_D3D9_ENABLE_TEXTURE
+#include "pw_d3d9_texture_proxy.h"
+#endif
+#ifdef PW_D3D9_ENABLE_STATEBLOCK
+#include "pw_d3d9_stateblock_client.h"
+#endif
+#ifdef PW_D3D9_ENABLE_OBJECT_GETTER
+#include "pw_d3d9_device_object_methods.h"
+#endif
 #include "pw_d3d9_inventory.h"
 #include "../pw_d3d9_window_driver.h"
 #include <stdio.h>
@@ -191,6 +209,116 @@ static HRESULT WINAPI present(IDirect3DDevice9 *iface,const RECT *source,const R
     }
     addref(iface);HRESULT hr=pw_d3d9_session_device(d->session,d->remote,&q,&r);release(iface);return hr;
 }
+#if defined(PW_D3D9_ENABLE_METHODS)||defined(PW_D3D9_ENABLE_RESOURCE)||defined(PW_D3D9_ENABLE_PROGRAM)||defined(PW_D3D9_ENABLE_TEXTURE)||defined(PW_D3D9_ENABLE_STATEBLOCK)
+static void fail_device(IDirect3DDevice9 *iface,HRESULT hr)
+{(void)hr;struct device_proxy *d=device(iface);InterlockedExchange(&d->failed,1);pw_d3d9_session_cancel(d->session);}
+#endif
+#if defined(PW_D3D9_ENABLE_RESOURCE)||defined(PW_D3D9_ENABLE_PROGRAM)||defined(PW_D3D9_ENABLE_TEXTURE)||defined(PW_D3D9_ENABLE_STATEBLOCK)
+static HRESULT release_object(IDirect3DDevice9 *iface,struct pw_d3d9_object_ref ref)
+{addref(iface);HRESULT hr=pw_d3d9_session_release(device(iface)->session,ref);release(iface);return hr;}
+static HRESULT defer_object(IDirect3DDevice9 *iface,struct pw_d3d9_deferred *cleanup)
+{return pw_d3d9_session_defer(device(iface)->session,cleanup);}
+#endif
+#ifdef PW_D3D9_ENABLE_RESOURCE
+static HRESULT resource_call(IDirect3DDevice9 *iface,struct pw_d3d9_object_ref ref,const struct pw_d3d9_resource_request *q,struct pw_d3d9_resource_reply *r)
+{
+    struct device_proxy *d=device(iface);if(d->failed)return D3DERR_NOTAVAILABLE;
+    if(!ref.id&&!ref.generation)ref=d->remote;
+    addref(iface);HRESULT hr=pw_d3d9_session_resource(d->session,ref,q,r);release(iface);return hr;
+}
+#endif
+#ifdef PW_D3D9_ENABLE_TEXTURE
+static HRESULT texture_call(IDirect3DDevice9 *iface,struct pw_d3d9_object_ref ref,const struct pw_d3d9_texture_request *q,struct pw_d3d9_texture_reply *r)
+{
+    struct device_proxy *d=device(iface);if(d->failed)return D3DERR_NOTAVAILABLE;
+    if(!ref.id&&!ref.generation)ref=d->remote;
+    addref(iface);HRESULT hr=pw_d3d9_session_texture(d->session,ref,q,r);release(iface);return hr;
+}
+#endif
+#ifdef PW_D3D9_ENABLE_STATEBLOCK
+static HRESULT stateblock_call(IDirect3DDevice9 *iface,struct pw_d3d9_object_ref ref,const struct pw_d3d9_stateblock_request *q,struct pw_d3d9_stateblock_reply *r)
+{
+    struct device_proxy *d=device(iface);if(d->failed)return D3DERR_NOTAVAILABLE;
+    if(!ref.id&&!ref.generation)ref=d->remote;
+    addref(iface);HRESULT hr=pw_d3d9_session_stateblock(d->session,ref,q,r);release(iface);return hr;
+}
+#endif
+#ifdef PW_D3D9_ENABLE_PROGRAM
+static HRESULT program_call(IDirect3DDevice9 *iface,const struct pw_d3d9_program_request *q,struct pw_d3d9_program_reply *r)
+{
+    struct device_proxy *d=device(iface);if(d->failed)return D3DERR_NOTAVAILABLE;
+    addref(iface);HRESULT hr=pw_d3d9_session_program(d->session,d->remote,q,r);release(iface);return hr;
+}
+static HRESULT program_query(IDirect3DDevice9 *iface,struct pw_d3d9_object_ref ref,uint32_t kind,void *output,UINT *size)
+{
+    if(!size)return D3DERR_INVALIDCALL;
+    struct device_proxy *d=device(iface);if(d->failed)return D3DERR_NOTAVAILABLE;
+    addref(iface);UINT capacity=*size;unsigned char *copy=NULL;HRESULT hr;
+    struct pw_d3d9_program_query_request q={.operation=PW_D3D9_PROGRAM_SIZE,.kind=kind,.capacity=capacity};struct pw_d3d9_program_query_reply r={0};
+    hr=pw_d3d9_session_program_query(d->session,ref,&q,&r);
+    if(FAILED(hr)){if(r.operation==q.operation)*size=r.size;goto done;}
+    if(!output){*size=r.size;goto done;}
+    uint32_t total=r.total,bytes=kind==7?total:(capacity<total?capacity:total),offset=0,returned_size=capacity;
+    copy=HeapAlloc(GetProcessHeap(),0,bytes?bytes:1);if(!copy){hr=E_OUTOFMEMORY;goto done;}
+    do{
+        q=(struct pw_d3d9_program_query_request){.operation=PW_D3D9_PROGRAM_READ,.kind=kind,.capacity=capacity,.offset=offset,.count=bytes-offset>4096?4096:bytes-offset};
+        memset(&r,0,sizeof(r));hr=pw_d3d9_session_program_query(d->session,ref,&q,&r);
+        if(FAILED(hr)){if(r.operation==q.operation)*size=r.size;goto done;}
+        if(r.total!=total||r.offset!=offset||r.count!=q.count){hr=E_FAIL;fail_device(iface,hr);goto done;}
+        memcpy(copy+offset,r.data,r.count);offset+=r.count;returned_size=r.size;
+    }while(offset<bytes);
+    SIZE_T written=0;
+    if(bytes&&(!WriteProcessMemory(GetCurrentProcess(),output,copy,bytes,&written)||written!=bytes)){hr=D3DERR_INVALIDCALL;goto done;}
+    *size=returned_size;
+ done:
+    if(copy)HeapFree(GetProcessHeap(),0,copy);
+    release(iface);return hr;
+}
+#endif
+#ifdef PW_D3D9_ENABLE_METHODS
+static HRESULT command_call(IDirect3DDevice9 *iface,const struct pw_d3d9_command *q)
+{
+    struct device_proxy *d=device(iface);if(d->failed)return D3DERR_NOTAVAILABLE;
+    addref(iface);HRESULT hr=pw_d3d9_session_command(d->session,d->remote,q);release(iface);return hr;
+}
+static HRESULT getter_call(IDirect3DDevice9 *iface,const struct pw_d3d9_getter_request *q,struct pw_d3d9_getter_reply *r)
+{
+    struct device_proxy *d=device(iface);if(d->failed)return D3DERR_NOTAVAILABLE;
+    addref(iface);HRESULT hr=pw_d3d9_session_getter(d->session,d->remote,q,r);
+    if(FAILED(hr)&&hr!=RPC_E_CANTCALLOUT_ININPUTSYNCCALL&&(q->method==4||q->method==15||q->method==78||q->method==80))fail_device(iface,hr);
+    release(iface);return hr;
+}
+static HRESULT resolve_object(IDirect3DDevice9 *iface,IUnknown *local,uint32_t kind,struct pw_d3d9_object_ref *ref)
+{
+    if(!ref)return E_POINTER;
+    *ref=(struct pw_d3d9_object_ref){0};if(!local)return S_OK;
+#ifdef PW_D3D9_ENABLE_RESOURCE
+    if(kind==3||kind==4)return pw_d3d9_buffer_proxy_resolve(iface,local,kind,ref);
+#endif
+#ifdef PW_D3D9_ENABLE_PROGRAM
+    if(kind>=7&&kind<=9)return pw_d3d9_program_proxy_resolve(iface,local,kind,ref);
+#endif
+#ifdef PW_D3D9_ENABLE_TEXTURE
+    if(kind==5||kind==6)return pw_d3d9_texture_proxy_resolve(iface,local,kind,ref);
+#endif
+    return D3DERR_INVALIDCALL;
+}
+#endif
+#ifdef PW_D3D9_ENABLE_OBJECT_GETTER
+static HRESULT object_getter_call(IDirect3DDevice9 *iface,const struct pw_d3d9_object_getter_request *q,struct pw_d3d9_object_getter_reply *r)
+{
+    struct device_proxy *d=device(iface);if(d->failed)return D3DERR_NOTAVAILABLE;
+    addref(iface);HRESULT hr=pw_d3d9_session_object_getter(d->session,d->remote,q,r);release(iface);return hr;
+}
+static HRESULT wrap_object(IDirect3DDevice9 *iface,uint32_t kind,struct pw_d3d9_object_ref ref,void **out)
+{
+    if(kind==3||kind==4)return pw_d3d9_buffer_proxy_wrap(iface,kind,ref,out);
+    if(kind==5||kind==6)return pw_d3d9_texture_proxy_wrap(iface,kind,ref,0,out);
+    if(kind>=7&&kind<=9)return pw_d3d9_program_proxy_wrap(iface,kind,ref,out);
+    if(out)*out=NULL;
+    fail_device(iface,E_NOINTERFACE);return E_NOINTERFACE;
+}
+#endif
 static BOOL CALLBACK init_vtable(INIT_ONCE *once,void *parameter,void **context)
 {
     (void)once;(void)parameter;(void)context;
@@ -199,7 +327,27 @@ static BOOL CALLBACK init_vtable(INIT_ONCE *once,void *parameter,void **context)
 #undef INIT
     vtable.QueryInterface=query;vtable.AddRef=addref;vtable.Release=release;
     vtable.GetDirect3D=get_parent;vtable.GetCreationParameters=get_creation;vtable.GetDeviceCaps=get_caps;
-    vtable.Reset=reset;vtable.Present=present;return TRUE;
+    vtable.Reset=reset;vtable.Present=present;
+#ifdef PW_D3D9_ENABLE_METHODS
+    const struct pw_d3d9_device_methods_ops methods={command_call,getter_call,fail_device,resolve_object};pw_d3d9_device_methods_install(&vtable,&methods);
+#endif
+#ifdef PW_D3D9_ENABLE_RESOURCE
+    const struct pw_d3d9_buffer_proxy_ops buffers={resource_call,release_object,defer_object,fail_device};
+    if(FAILED(pw_d3d9_buffer_proxy_install(&vtable,&buffers)))return FALSE;
+#endif
+#ifdef PW_D3D9_ENABLE_PROGRAM
+    const struct pw_d3d9_program_proxy_ops programs={program_call,program_query,release_object,defer_object,fail_device};pw_d3d9_program_proxy_install(&vtable,&programs);
+#endif
+#ifdef PW_D3D9_ENABLE_TEXTURE
+    const struct pw_d3d9_texture_proxy_ops textures={texture_call,release_object,defer_object,fail_device};pw_d3d9_texture_proxy_install(&vtable,&textures);
+#endif
+#ifdef PW_D3D9_ENABLE_STATEBLOCK
+    const struct pw_d3d9_stateblock_client_ops blocks={stateblock_call,release_object,defer_object,fail_device};pw_d3d9_stateblock_client_install(&vtable,&blocks);
+#endif
+#ifdef PW_D3D9_ENABLE_OBJECT_GETTER
+    const struct pw_d3d9_device_object_methods_ops objects={object_getter_call,wrap_object,fail_device};pw_d3d9_device_object_methods_install(&vtable,&objects);
+#endif
+    return TRUE;
 }
 HRESULT pw_d3d9_device_proxy_create(IDirect3D9 *parent,struct pw_d3d9_session *session,
     struct pw_d3d9_object_ref parent_ref,UINT adapter,D3DDEVTYPE type,HWND focus,DWORD flags,D3DPRESENT_PARAMETERS *parameters,IDirect3DDevice9 **out)
