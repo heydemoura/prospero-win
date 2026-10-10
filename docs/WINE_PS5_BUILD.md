@@ -116,6 +116,7 @@ before evaluating a candidate built from that cache.
 | 0897 | `ntdll`: a reservation at a fixed address outside the reserved areas is handed to the direct-memory allocator until it is unmapped, so committing it backs its pages; the console does not back a bare reservation when it is protected, and the first write to such a commit faulted (Steam's protection layer on 64-bit games) |
 | 0898 | `ntdll`: this process's memory counters (GetProcessMemoryInfo, ProcessVmCounters, SystemProcessInformation) come from its views, also for a handle opened on its own id; the console has no /proc or procstat, and every counter was zero |
 | 0899 | `include`: list the PS5 sync headers (0810, 0820, 0885, 0887) in `include/Makefile.in`, which makedep needs to resolve them; configure failed without it |
+| 0902 | `win32u`: the PS5 driver sends the arrows, Insert, Delete, Home, End, Page Up, Page Down, right Ctrl and Alt, the Windows and menu keys and keypad `/` with `KEYEVENTF_EXTENDEDKEY`; their scan codes are the keypad's without it, so DirectInput reported the keypad's 8 for the up arrow and a game's arrow-key bindings never fired |
 
 ## Allocator
 
