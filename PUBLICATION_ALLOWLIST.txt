@@ -549,3 +549,4 @@ wine/ps5/pw_vk_radv_profile_wrap.h
 docs/cs-thread-profile.md
 tests/test_native_profile_frames.py
 tools/native_profile_frames.py
+wine/patches/0879-win32u-ps5-report-a-drained-wake-pipe.patch
