@@ -799,6 +799,19 @@ logs the failure and returns to Home without loading profiles or starting
 Wine. Each launcher/game `LoadExec` process performs its own request through
 the same startup point.
 
+Some loaders show `/data` to every app without elevating it: ShadowMountPlus
+1.7beta4 mounts it into the sandbox, and PS5SXHelper's "mountroot" does the
+same. Such a title can `stat()` `/data` but gets `EPERM` from `lstat()` on
+every path, and Wine then exits in `server_init_process`. A `/data` that is
+already visible therefore counts as an existing grant only when `lstat()`
+works on it too (`lstat()` failing with `EPERM` is the only sign of "not
+elevated"); otherwise the title asks the helper as above and then waits for
+`lstat()` to work, not only for `/data` to be visible. If the helper refuses,
+or says yes but the title is still not elevated after the wait, the title keeps
+the visible `/data` and goes on as before (`data_mount data_before=1
+elevated_before=0 helper_completed=0` or `helper_completed=1 elevated_after=0`
+in the log).
+
 The title build fetches the helper and manifest from one pinned release of
 `mpereiraesaa/PS5-Lapy-JB-Daemon` every time: `lapy_release` in
 `tools/build_native.sh`, with the SHA-256 of its `lapy.elf` beside it
