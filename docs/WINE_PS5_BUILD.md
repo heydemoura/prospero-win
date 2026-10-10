@@ -1031,10 +1031,27 @@ The runtime is staged beside the title:
   `getnameinfo` and `gethostbyname` in `libScePosixForWebKit`, which only
   the WebKit process gets, so in a title they stayed NULL and every lookup
   faulted (GTA IV, tens of thousands a minute). `wine/ps5/pw_ws2_32_libc.c`
-  provides them, with `gethostbyaddr` and `h_errno`. There is no DNS: they
-  answer numeric addresses, the wildcard and loopback addresses, and
-  `localhost` and the console's own host name (loopback); any other name is
-  not found, and a service must be a port number; and `crypt32.prx`, CryptoAPI's
+  provides them, with `gethostbyaddr` and `h_errno`. They answer numeric
+  addresses, the wildcard and loopback addresses, and `localhost` and the
+  console's own host name (loopback) themselves, and take a name with a dot
+  in it to the console's own resolver, libSceNet's (`sceNetResolverStartNtoa`
+  and `Ntoa6`, a pool and a resolver per lookup, as the payload SDK's libc
+  does, 5 s and two retries per attempt, so a lookup ends within 15 s per
+  address family; the AAAA question is only asked when IPv6 was asked for
+  or there was no A, and one address per family is returned, so a program
+  does not fail over between a host's several A records). `gethostname`
+  reports the stable name `PS5`, which resolves to loopback before any
+  resolver is reached: a game's probe of its own host name (GTA IV, tens
+  of thousands of times a minute) stays local and instant. Any other name
+  without a dot is not found at once: the computer name a prefix made on a
+  PC carries is one, and a router that resolved it would make the game
+  believe it is online. A dotted name the console did not know, or did not
+  answer for in time, is not found either, and is remembered for 5 s (16
+  names, per address family) so asking again does not block on another
+  lookup. DNS answers are not authenticated, as for any client on a LAN;
+  what a program then trusts rests on TLS validation, schannel's
+  (`secur32.prx`) with crypt32's root store, see [TLS](#tls). A service
+  must be a port number. `ws2_32.prx` therefore needs `libSceNet.sprx`; and `crypt32.prx`, CryptoAPI's
   Unix side, without which `crypt32.dll` refuses to load: FFmpeg's
   `avformat` imports it, so LAV Filters, the DirectShow splitter and
   decoders Warcraft III's cinematics play through, need it (the console's

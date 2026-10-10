@@ -556,3 +556,4 @@ tools/native_profile_frames.py
 tests/test_symbolize_guest_stack.py
 tools/symbolize_guest_stack.py
 wine/patches/0879-win32u-ps5-report-a-drained-wake-pipe.patch
+wine/ps5/pw_ws2_32_resolver.h
