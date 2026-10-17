@@ -57,7 +57,7 @@ int sceKernelAllocateMainDirectMemory(size_t bytes, size_t alignment, int type, 
 int sceKernelMapDirectMemory(void **address, size_t bytes, int protection, int flags, int64_t offset,
                              size_t alignment)
 {
-    (void)alignment;
+    assert(alignment == PAGE);
     if (refuse_map || (protection & 4)) return (int)0x80020016;
     /* A kernel that wants the GPU bits refuses CPU-only memory. */
     if (cpu_only_refused && protection == 3) return (int)0x80020016;
@@ -70,8 +70,23 @@ int sceKernelMapDirectMemory(void **address, size_t bytes, int protection, int f
             static int mapped_once;
             if (mapped_once++ & 1) return (int)0x80020016;
         }
-        at = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, phys_fd, offset);
-        if (at == MAP_FAILED) return (int)0x8002000c;
+        /* The real kernel honours the requested 16 KiB alignment. Keep
+         * the aligned range reserved while replacing it with the memfd. */
+        void *reservation = mmap(NULL, bytes + alignment, PROT_NONE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (reservation == MAP_FAILED) return (int)0x8002000c;
+        uintptr_t aligned = ((uintptr_t)reservation + alignment - 1) & ~(alignment - 1);
+        size_t prefix = aligned - (uintptr_t)reservation;
+        size_t suffix = alignment - prefix;
+        if (prefix) assert(!munmap(reservation, prefix));
+        if (suffix) assert(!munmap((void *)(aligned + bytes), suffix));
+        at = mmap((void *)aligned, bytes, PROT_READ | PROT_WRITE,
+                  MAP_SHARED | MAP_FIXED, phys_fd, offset);
+        if (at == MAP_FAILED) {
+            assert(!munmap((void *)aligned, bytes));
+            return (int)0x8002000c;
+        }
+        assert(!((uintptr_t)at % alignment));
         *address = at;
         return 0;
     }

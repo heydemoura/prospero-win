@@ -481,9 +481,13 @@ static void *map_registered(void *address, size_t bytes, int protection, int fla
             (void)unmap(NULL, (uintptr_t)where, end - at);
             goto failed;
         }
+        /* Keep the length actually mapped, independent of the address
+         * returned by the kernel. Re-rounding it can retain an unmapped
+         * tail and its section reference if that address is unaligned. */
+        size_t mapped = end - at;
         address = where;
         at = (uintptr_t)where;
-        end = at + page_span(address, bytes);
+        end = at + mapped;
     }
     sections_lock();
     views[slot] = (View){ at, end, i + 1 };
