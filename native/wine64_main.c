@@ -40,6 +40,7 @@
 #include "pw_wine_prefix.h"
 #include "../src/pw_present.h"
 #include "../src/pw_spinner.h"
+#include "../src/pw_tsc_calibrate.h"
 #include "pw_wine_display.h"
 #include "../include/prospero_win.h"
 
@@ -62,6 +63,8 @@
  * once /data is granted the process sees the real root, where /app0 does
  * not exist (measured), and the sandbox's view of app0 is used instead. */
 #define PW_WINE64_RUNTIME "/win/wine/lib/wine/x86_64-unix"
+/* Its 64-bit PE modules, among them the WoW64 CPU backends. */
+#define PW_WINE64_PE_RUNTIME "/win/wine/lib/wine/x86_64-windows"
 #define PW_SANDBOX_APP0 "/mnt/sandbox/" PW_TITLE_ID "_000/app0"
 static const char *const runtime_roots[] = { "/app0", PW_SANDBOX_APP0 };
 /* The title's data: profiles/, input/, prefix/ and prefixes/<name>. */
@@ -311,6 +314,10 @@ static uint64_t now_ns(void)
     return (uint64_t)value.tv_sec * 1000000000u + (uint64_t)value.tv_nsec;
 }
 
+/* [runtime] fast_clock: the readers pw_tsc_measure takes. */
+static uint64_t calibration_clock(void *context) { (void)context; return now_ns(); }
+static uint64_t calibration_tsc(void *context) { (void)context; return __builtin_ia32_rdtsc(); }
+
 /* ---- Wine stderr -> ps5log, one line per text line -------------------- */
 
 static char sink_line[1024];
@@ -353,6 +360,32 @@ static int wine_present(void *context, const void *bgra, uint32_t width, uint32_
  * output (patch 0460), which the title must close first. The main thread
  * owns the title's, so the driver's request waits for it to be closed. */
 static int display_request, display_closed;
+enum { PW_WINE64_QUIESCE_MS = 500 };
+
+/* Wine's dlsym, for the exports of the modules it loaded (libvulkan.prx). */
+static void *(*wine_dlsym_fn)(void *, const char *);
+
+/* Once the display is Vulkan's, the game's last flips are still on their
+ * way when Wine exits: RADV's own flip thread submits them after the game's
+ * threads are gone. A process replaced with such a flip queued stayed at
+ * the system's "Closing" screen (Project Eagle, 2026-10-12). libvulkan.prx
+ * drains them (pw_videoout_quiesce); an older driver has no such export. */
+static void display_quiesce(const char *reason)
+{
+    int (*quiesce)(unsigned, unsigned *, int *);
+    unsigned waited = 0;
+    int pending = 0, status;
+
+    if (!__atomic_load_n(&display_closed, __ATOMIC_ACQUIRE) || !wine_dlsym_fn) return;
+    quiesce = (int (*)(unsigned, unsigned *, int *))(uintptr_t)wine_dlsym_fn(NULL, "pw_videoout_quiesce");
+    if (!quiesce) {
+        PS5LOG_LOG("PW_WINE64 display quiesce reason=%s status=unavailable", reason);
+        return;
+    }
+    status = quiesce(PW_WINE64_QUIESCE_MS, &waited, &pending);
+    PS5LOG_LOG("PW_WINE64 display quiesce reason=%s status=%d waited_ms=%u pending=%d", reason, status,
+               waited, pending);
+}
 
 static int wine_release_display(void *context)
 {
@@ -608,6 +641,7 @@ static void restart_title(const PwWineApp *app, uint32_t cycle, const char *reas
         PS5LOG_LOG("PW_WINE64 restart refused: arguments do not fit");
         return;
     }
+    display_quiesce(reason);
     for (size_t i = 0; i < sizeof(eboots) / sizeof(eboots[0]); i++) {
         PS5LOG_LOG("PW_WINE64 restart to=%s cycle=%u reason=%s eboot=%s", app ? app->id : "launcher",
                    (unsigned)cycle, reason, eboots[i]);
@@ -638,9 +672,10 @@ static int open_library(void)
 
     status = pw_data_mount_request(&mount);
     if (status == 0) library_root = PW_WINE64_ROOT_DATA;
-    PS5LOG_LOG("PW_WINE64 data_mount data_before=%d helper_completed=%d helper_errno=%d data_after=%d "
-               "waited_ms=%d settled_ms=%d root=%s", mount.data_before,
-               mount.helper_completed, mount.helper_errno, mount.data_after, mount.waited_ms,
+    PS5LOG_LOG("PW_WINE64 data_mount data_before=%d elevated_before=%d helper_completed=%d "
+               "helper_errno=%d data_after=%d elevated_after=%d waited_ms=%d settled_ms=%d root=%s",
+               mount.data_before, mount.elevated_before, mount.helper_completed,
+               mount.helper_errno, mount.data_after, mount.elevated_after, mount.waited_ms,
                mount.settled_ms, status == 0 ? library_root : "unavailable");
     if (status != 0) return -1;
     status = pw_wine_library_load(&library, library_root);
@@ -657,13 +692,13 @@ static int open_library(void)
             snprintf(catalog_detail[catalog_count], sizeof(catalog_detail[0]), "%s  %s  %ux%u",
                      game->app.architecture == PW_APP_ARCH_PE64 ? "pe64" : "pe32",
                      game->app.graphics == PW_APP_GRAPHICS_DXVK ? "dxvk" :
-                     game->app.graphics == PW_APP_GRAPHICS_OPENGL ? "opengl" : "gdi",
+                     game->app.graphics == PW_APP_GRAPHICS_ZINK ? "opengl" : "gdi",
                      (unsigned)game->display.width, (unsigned)game->display.height);
         else
             snprintf(catalog_detail[catalog_count], sizeof(catalog_detail[0]), "%s  %s",
                      game->app.architecture == PW_APP_ARCH_PE64 ? "pe64" : "pe32",
                      game->app.graphics == PW_APP_GRAPHICS_DXVK ? "dxvk" :
-                     game->app.graphics == PW_APP_GRAPHICS_OPENGL ? "opengl" : "gdi");
+                     game->app.graphics == PW_APP_GRAPHICS_ZINK ? "opengl" : "gdi");
         catalog[catalog_count] = (PwWineApp){ game->app.id, game->app.name,
                                               catalog_detail[catalog_count], game->app.executable };
         catalog_count++;
@@ -886,7 +921,10 @@ static int start_thread(void (*entry)(void *), void *arg, size_t stack_bytes)
 int main(int argc, char **argv)
 {
     static char prefix[PW_WINE_LIBRARY_PATH + PW_APP_ID_CAPACITY], desktop[24], view[8] = "window";
-    enum { WINE64_FIXED_ENV_COUNT = 6, WINE64_PROFILE_ENV_CAPACITY = 7 + PW_GAME_RUNTIME_ENV_MAX };
+    static char radv_cache[PW_WINE_LIBRARY_PATH + 16];
+    enum { WINE64_FIXED_ENV_COUNT = 7,
+           WINE64_PROFILE_ENV_CAPACITY = 3 + PW_GAME_GRAPHICS_ENV_MAX + PW_GAME_RUNTIME_ENV_MAX + PW_GAME_CPU_ENV_MAX +
+                                         PW_GAME_CLOCK_ENV_MAX + PW_GAME_DEBUG_ENV_MAX };
     static PwWineStartEnv extra[WINE64_FIXED_ENV_COUNT + WINE64_PROFILE_ENV_CAPACITY] = {
         { "WINEDEBUG", PW_WINE64_DEBUG },
         /* the i386 exe runs in this process through WoW64; otherwise Wine
@@ -896,6 +934,13 @@ int main(int argc, char **argv)
         { "USER", "prospero" },
         { "WINE_PS5_TRACE_STARTUP", "1" },  /* patch 0560: name startup steps */
         { "WINE_PS5_VIEW", view },          /* patch 0430: the game's windows, or the desktop */
+        /* RADV's shader cache. The driver's PS5 layer would put it under
+         * /app0, which this title cannot write, and then run without one:
+         * every launch compiled every pipeline again (2 s of compiles in
+         * the first 100 s of GTA San Andreas, in 25-50 ms frames). The
+         * driver keeps the first value, so this must be set before it
+         * starts; a profile's [debug] env line still overrides it. */
+        { "MESA_SHADER_CACHE_DIR", radv_cache },
         { NULL, NULL }, { NULL, NULL }, { NULL, NULL }, { NULL, NULL }, /* profile-specific environment */
     };
     _Static_assert(sizeof(extra) / sizeof(extra[0]) ==
@@ -906,7 +951,7 @@ int main(int argc, char **argv)
     /* wine, the executable, the profile's argument words, NULL */
     static const char *wine_argv[2 + PW_WINE_LAUNCH_WORDS + 1] = { "wine" };
     static char argument_words[PW_APP_ARGUMENTS_CAPACITY];
-    static char effective_dll_overrides[PW_APP_DLL_OVERRIDES_CAPACITY + sizeof(";opengl32=b")];
+    static char effective_dll_overrides[PW_APP_DLL_OVERRIDES_CAPACITY + sizeof(";opengl32=n")];
     static char ntdll_dir[256], ntdll_path[288];
     static const PwWineStartOps ops = {
         sceKernelLoadStartModule, sceKernelGetModuleInfo, set_env, start_thread };
@@ -922,6 +967,11 @@ int main(int argc, char **argv)
     static PwPadPs5 pad;
     static PwHidPs5 hid;
     static PwGameInput game_input;
+    /* [input] player2: a second signed-in user's DualSense as more keys. */
+    static PwPadPs5 pad2;
+    static PwGameInput game_input2;
+    int player2 = 0, pad2_status = PW_ERR_NOT_FOUND;
+    uint64_t pad2_seen = 0;   /* the tick pad 2 last reported a controller */
     const PwGameProfile *game = NULL;
     int scaling = PW_PRESENT_SCALE_FIT;
     PwWinePointer pointer = { 0, 0 };
@@ -963,8 +1013,14 @@ int main(int argc, char **argv)
         snprintf(prefix, sizeof(prefix), "%s/prefixes/%s", library_root, game->app.prefix);
     else
         snprintf(prefix, sizeof(prefix), "%s/prefix", library_root);
+    snprintf(radv_cache, sizeof(radv_cache), "%s/cache/radv", library_root);
     if (game) {
         int input_status = pw_wine_library_input(game, library_root, &game_input);
+        int input2_status = pw_wine_library_player2_input(game, library_root, &game_input2);
+        player2 = input2_status == PW_OK;
+        if (input2_status != PW_ERR_NOT_FOUND)
+            PS5LOG_LOG("PW_WINE64 player2 preset=%s input=%s", game->input.player2,
+                       pw_result_name(input2_status));
         scaling = (int)game->display.scaling;
         if (game->display.view == PW_GAME_VIEW_DESKTOP) snprintf(view, sizeof(view), "desktop");
         if (game->display.width) {
@@ -972,30 +1028,37 @@ int main(int argc, char **argv)
                      (unsigned)game->display.height);
             extra[config.extra_env_count++] = (PwWineStartEnv){ "WINE_PS5_DESKTOP", desktop };
         }
-        /* Profile graphics mode selects Wine's builtin WGL implementation;
-         * preserve other per-game overrides such as DXVK when composing it. */
+        /* OpenGL selects the native Zink provider; preserve other per-game
+         * overrides such as DXVK when composing it. */
         int overrides_status = pw_app_profile_effective_dll_overrides(
             &game->app, effective_dll_overrides, sizeof(effective_dll_overrides));
         if (overrides_status == PW_OK && effective_dll_overrides[0])
             extra[config.extra_env_count++] = (PwWineStartEnv){ "WINEDLLOVERRIDES", effective_dll_overrides };
-        else if (overrides_status != PW_OK)
+        else if (overrides_status != PW_OK) {
             PS5LOG_LOG("PW_WINE64 DLL overrides refused: %s", game->app.id);
-        if (game->app.graphics == PW_APP_GRAPHICS_OPENGL)
-            extra[config.extra_env_count++] = (PwWineStartEnv){ "WINE_PS5_OPENGL", "1" };
-        /* [display] show_fps: the backend's own counter, top left. Mesa draws
-         * text only where the PS5 OpenGL SDK's EGL calls its HUD. */
-        if (game->display.show_fps)
-            extra[config.extra_env_count++] = game->app.graphics == PW_APP_GRAPHICS_OPENGL
-                ? (PwWineStartEnv){ "GALLIUM_HUD", "simple,fps" } : (PwWineStartEnv){ "DXVK_HUD", "fps" };
-        /* [display] refresh = 120: the PS5 OpenGL SDK asks the display for
-         * 120 Hz (Wine patch 0722). The title declares the capability in its
-         * param.json; a display without 120 Hz keeps presenting at 60. */
-        if (game->app.graphics == PW_APP_GRAPHICS_OPENGL && game->display.refresh == 120)
-            extra[config.extra_env_count++] = (PwWineStartEnv){ "WINE_PS5_GL_REFRESH", "120" };
-        /* [display] opengl_thread: Mesa's glthread runs the game's OpenGL
-         * calls on a worker thread, so the driver's work overlaps the game's. */
-        if (game->app.graphics == PW_APP_GRAPHICS_OPENGL && game->display.opengl_thread)
-            extra[config.extra_env_count++] = (PwWineStartEnv){ "PS5_GLTHREAD", "1" };
+            return 1;
+        }
+        {
+            PwGameEnv graphics_env[PW_GAME_GRAPHICS_ENV_MAX];
+            size_t graphics_count = pw_game_graphics_env(game, graphics_env);
+            for (size_t i = 0; i < graphics_count; i++)
+                extra[config.extra_env_count++] = (PwWineStartEnv){ graphics_env[i].name, graphics_env[i].value };
+        }
+        if (game->app.graphics == PW_APP_GRAPHICS_ZINK) {
+            int provider_status = PW_ERR_NOT_FOUND;
+            unsigned copied = 0;
+            for (size_t i = 0; i < sizeof(runtime_roots) / sizeof(runtime_roots[0]); i++) {
+                char provider[512];
+                int length = snprintf(provider, sizeof(provider), "%s/win/mesa-zink/%s", runtime_roots[i],
+                    game->app.architecture == PW_APP_ARCH_PE32 ? "i386-windows" : "x86_64-windows");
+                if (length < 0 || (size_t)length >= sizeof(provider)) { provider_status = PW_ERR_LIMIT; break; }
+                provider_status = pw_wine_prefix_zink_install(prefix, provider, game->app.architecture, &copied);
+                if (provider_status != PW_ERR_NOT_FOUND) break;
+            }
+            PS5LOG_LOG("PW_WINE64 zink provider=%s copied=%u architecture=%s", pw_result_name(provider_status),
+                       copied, game->app.architecture == PW_APP_ARCH_PE32 ? "pe32" : "pe64");
+            if (provider_status != PW_OK) return 1;
+        }
         /* xinput mode: SDL2 games (Half-Life) look for controllers through
          * raw input first, which Wine on the PS5 has none of, and then skip
          * XInput; this hint makes them read controller 0 through XInput. */
@@ -1008,18 +1071,76 @@ int main(int argc, char **argv)
 
             for (size_t i = 0; i < runtime_count; i++)
                 extra[config.extra_env_count++] = (PwWineStartEnv){ runtime_env[i].name, runtime_env[i].value };
-            PS5LOG_LOG("PW_WINE64 runtime thread_scheduling=%d", game->runtime.thread_scheduling);
+            PS5LOG_LOG("PW_WINE64 runtime thread_scheduling=%d shared_input=%d", game->runtime.thread_scheduling,
+                       game->runtime.shared_input);
+        }
+        /* [runtime] fast_clock: patch 0900 answers QueryPerformanceCounter
+         * from the TSC only when told its frequency; measure it now, and
+         * leave the game on Wine's normal counter if the two measurements
+         * disagree or look wrong (src/pw_tsc_calibrate.h). */
+        if (game->runtime.fast_clock) {
+            static char tsc_hz_text[24];
+            uint64_t hz = 0;
+            PwTscStatus clock_status = pw_tsc_measure(calibration_clock, calibration_tsc, NULL, &hz);
+
+            if (clock_status == PW_TSC_OK) {
+                snprintf(tsc_hz_text, sizeof(tsc_hz_text), "%llu", (unsigned long long)hz);
+                extra[config.extra_env_count++] = (PwWineStartEnv){ "PW_QPC_TSC_VALIDATED", "1" };
+                extra[config.extra_env_count++] = (PwWineStartEnv){ "PW_QPC_TSC_HZ", tsc_hz_text };
+            }
+            PS5LOG_LOG("PW_WINE64 fast_clock=%s tsc_hz=%llu calibration=%s",
+                       clock_status == PW_TSC_OK ? "on" : "off", (unsigned long long)hz,
+                       pw_tsc_status_name(clock_status));
+        }
+        /* [runtime] cpu: a 32-bit game runs on the native WoW64 CPU unless it
+         * asks for the translator. The native CPU always brings the Vulkan
+         * batching (src/pw_game_profile.h). */
+        {
+            PwGameEnv cpu_env[PW_GAME_CPU_ENV_MAX];
+            size_t cpu_count = pw_game_cpu_env(game, cpu_env);
+            int installed = -2;
+
+            for (size_t i = 0; i < cpu_count; i++)
+                extra[config.extra_env_count++] = (PwWineStartEnv){ cpu_env[i].name, cpu_env[i].value };
+            /* WoW64 loads its CPU from the prefix's system32; when this copy
+             * fails, patch 0611 falls back to the prefix's own CPU. */
+            for (size_t i = 0; cpu_count && installed < 0 &&
+                               i < sizeof(runtime_roots) / sizeof(runtime_roots[0]); i++) {
+                char source[256];
+                snprintf(source, sizeof(source), "%s" PW_WINE64_PE_RUNTIME "/wow64native.dll",
+                         runtime_roots[i]);
+                installed = pw_wine_prefix_cpu_install(prefix, source, "wow64native.dll");
+            }
+            PS5LOG_LOG("PW_WINE64 cpu=%s prefix_cpu=%d", cpu_count ? "native" : "translator", installed);
         }
         /* [debug] winedebug: this game's channels in place of the title's. */
         if (game->winedebug[0]) {
             extra[0].value = game->winedebug;
             PS5LOG_LOG("PW_WINE64 winedebug=%s", game->winedebug);
         }
-        PS5LOG_LOG("PW_WINE64 profile id=%s prefix=%s desktop=%s scaling=%d view=%s show_fps=%d refresh=%u gl_thread=%d input=%s "
+        /* [debug] env: diagnostics variables; the parser refuses any the
+         * title sets itself, so these only add (src/pw_game_profile.h). */
+        {
+            PwGameEnv debug_env[PW_GAME_DEBUG_ENV_MAX];
+            size_t debug_count = pw_game_debug_env(game, debug_env);
+            char names[PW_GAME_DEBUG_ENV_MAX * PW_GAME_DEBUG_ENV_NAME] = "";
+
+            for (size_t i = 0; i < debug_count; i++) {
+                extra[config.extra_env_count++] = (PwWineStartEnv){ debug_env[i].name, debug_env[i].value };
+                if (i) strcat(names, ",");
+                strcat(names, debug_env[i].name);
+            }
+            if (debug_count) PS5LOG_LOG("PW_WINE64 debug_env=%s", names);
+        }
+        /* refresh and opengl_thread set the PS5 OpenGL SDK's output rate and
+         * glthread; Zink, which replaced it, has neither, so they are ignored. */
+        if (game->display.refresh != 60 || game->display.opengl_thread)
+            PS5LOG_LOG("PW_WINE64 ignored display refresh=%u opengl_thread=%d (no longer supported)",
+                       (unsigned)game->display.refresh, game->display.opengl_thread);
+        PS5LOG_LOG("PW_WINE64 profile id=%s prefix=%s desktop=%s scaling=%d view=%s show_fps=%d input=%s "
                    "preset=%s mode=%s mouse=%d dll_overrides=%s", game->app.id, prefix,
                    desktop[0] ? desktop : "default",
-                   scaling, view, game->display.show_fps, (unsigned)game->display.refresh,
-                   game->display.opengl_thread, pw_result_name(input_status),
+                   scaling, view, game->display.show_fps, pw_result_name(input_status),
                    game->input.preset[0] ? game->input.preset : "-",
                    game_input.mode == PW_GAME_INPUT_XINPUT ? "xinput" : "keyboard", (int)game_input.mouse,
                    effective_dll_overrides[0] ? effective_dll_overrides : "-");
@@ -1066,6 +1187,8 @@ int main(int argc, char **argv)
                start.segment_count, start.module_start_result, start.adopted != NULL,
                start.virtual_stats != NULL);
     install_early_fault_report(&start);
+    if (status == PW_OK)
+        wine_dlsym_fn = (void *(*)(void *, const char *))(uintptr_t)pw_prx_lookup(start.descriptor, "dlsym");
     atexit(on_exit_report);
     if (status == PW_OK) {
         void (*set_sink)(void (*)(const char *, size_t)) = (void (*)(void (*)(const char *, size_t)))
@@ -1089,6 +1212,9 @@ int main(int argc, char **argv)
         if (pad_status == PW_OK)
             pad_status = pw_pad_ps5_open(&pad, &pad_ops, pad_open_map,
                                          sizeof(pad_open_map) / sizeof(pad_open_map[0]));
+        if (player2 && pad_status == PW_OK)
+            pad2_status = pw_pad_ps5_open_other(&pad2, &pad, -1, pad_open_map,
+                                                sizeof(pad_open_map) / sizeof(pad_open_map[0]));
         /* A USB keyboard and mouse, the foreground user's, as the pad's. */
         if (post_input) {
             int32_t user = pad_status == PW_OK ? pad.user_id : -1;
@@ -1117,6 +1243,9 @@ int main(int argc, char **argv)
                    set_pad != NULL,
                    pw_result_name(video_status),
                    pw_result_name(pad_status), pw_result_name(hid_status));
+        if (player2)
+            PS5LOG_LOG("PW_WINE64 pad2 status=%s user=%d", pw_result_name(pad2_status),
+                       (int)pad2.user_id);
         {
             void (*set_audio)(PwWineAudioSink, void *) = (void (*)(PwWineAudioSink, void *))
                 (uintptr_t)pw_prx_lookup(start.descriptor, "pw_wine_set_audio_sink");
@@ -1258,6 +1387,40 @@ int main(int argc, char **argv)
                 if (!vibrations++ || vibrate != PW_OK)
                     PS5LOG_LOG("PW_WINE64 rumble left=%u right=%u status=%s rc=%d", (unsigned)left,
                                (unsigned)right, pw_result_name(vibrate), pad.vibration_rc);
+            }
+        }
+        /* The second player's pad: keys only, through its own preset, read
+         * whether or not the first pad's read worked. A user who signs in
+         * later is found by a retry every few seconds; a pick that shows no
+         * controller for that long, or loses it, is closed and the next
+         * signed-in user tried. Closing the game and rumble stay the first
+         * pad's. */
+        if (player2 && post_input) {
+            const uint64_t retry = 3 * PW_WINE64_TICKS_PER_S;
+            if (pad2_status == PW_OK && pw_pad_ps5_read(&pad2) == PW_OK) {
+                if (pad2.core.connected) pad2_seen = tick;
+                size_t count2 = pw_wine_game_inputs(&game_input2, pad2.core.pressed_edges,
+                                                    pad2.core.released_edges, events,
+                                                    sizeof(events) / sizeof(events[0]) - 1);
+                for (size_t i = 0; i < count2; i++) {
+                    if (post_input(&events[i]) == 0) posted++;
+                    else refused++;
+                }
+            }
+            int32_t after = -1;
+            if (pad2_status == PW_OK && !pad2.core.connected && tick - pad2_seen >= retry) {
+                after = pad2.user_id;
+                (void)pw_pad_ps5_close(&pad2);
+                pad2_status = PW_ERR_NOT_FOUND;
+            }
+            if (pad2_status != PW_OK && pad2_status != PW_ERR_UNSUPPORTED &&
+                (after >= 0 || tick % retry == 0)) {
+                pad2_status = pw_pad_ps5_open_other(&pad2, &pad, after, pad_open_map,
+                                                    sizeof(pad_open_map) / sizeof(pad_open_map[0]));
+                pad2_seen = tick;
+                if (pad2_status == PW_OK && pad2.user_id != after)
+                    PS5LOG_LOG("PW_WINE64 pad2 status=%s user=%d", pw_result_name(pad2_status),
+                               (int)pad2.user_id);
             }
         }
         if (__atomic_load_n(&display_request, __ATOMIC_ACQUIRE) &&
